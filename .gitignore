@@ -1,0 +1,8 @@
+venv/
+outputs/
+video/
+models/
+__pycache__/
+*.pyc
+yolo11n.pt
+.DS_Store
