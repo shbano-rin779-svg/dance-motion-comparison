@@ -349,6 +349,167 @@ def draw_angle_highlights(
         draw_text_with_background(frame, label, (text_x, text_y), font_scale=0.55, thickness=2)
 
 
+# ---------------------- Normalized skeleton overlay helpers ----------------------
+
+def get_normalized_joint_coordinates(
+    row: pd.Series,
+    joint_names: List[str],
+) -> Dict[str, np.ndarray]:
+    """Normalize pose by hip center and shoulder width.
+
+    This removes the influence of dancer position and body scale so that form differences
+    are easier to compare.
+    """
+    if row is None or row.get("pose_detected", 0) != 1:
+        return {}
+
+    def get_raw_point(joint_name: str) -> np.ndarray | None:
+        x = row.get(f"{joint_name}_x")
+        y = row.get(f"{joint_name}_y")
+        visibility = row.get(f"{joint_name}_visibility", 1.0)
+        if pd.isna(x) or pd.isna(y) or pd.isna(visibility):
+            return None
+        if float(visibility) < VISIBILITY_THRESHOLD:
+            return None
+        return np.array([float(x), float(y)], dtype=float)
+
+    left_hip = get_raw_point("left_hip")
+    right_hip = get_raw_point("right_hip")
+    left_shoulder = get_raw_point("left_shoulder")
+    right_shoulder = get_raw_point("right_shoulder")
+
+    if left_hip is None or right_hip is None or left_shoulder is None or right_shoulder is None:
+        return {}
+
+    hip_center = (left_hip + right_hip) / 2
+    shoulder_width = np.linalg.norm(left_shoulder - right_shoulder)
+    if shoulder_width <= 1e-6:
+        return {}
+
+    normalized_points: Dict[str, np.ndarray] = {}
+    for joint_name in joint_names:
+        point = get_raw_point(joint_name)
+        if point is None:
+            continue
+        normalized_points[joint_name] = (point - hip_center) / shoulder_width
+
+    return normalized_points
+
+
+def normalized_to_canvas_point(
+    normalized_point: np.ndarray,
+    canvas_width: int,
+    canvas_height: int,
+    scale: float,
+) -> Tuple[int, int]:
+    center = np.array([canvas_width / 2, canvas_height * 0.62], dtype=float)
+    point = center + normalized_point * scale
+    return int(point[0]), int(point[1])
+
+
+def draw_normalized_skeleton(
+    canvas: Frame,
+    normalized_points: Dict[str, np.ndarray],
+    color: Tuple[int, int, int],
+    thickness: int = 3,
+) -> None:
+    canvas_height, canvas_width = canvas.shape[:2]
+    scale = min(canvas_width, canvas_height) * 0.36
+
+    canvas_points: Dict[str, Tuple[int, int]] = {}
+    for joint_name, normalized_point in normalized_points.items():
+        canvas_points[joint_name] = normalized_to_canvas_point(
+            normalized_point,
+            canvas_width,
+            canvas_height,
+            scale,
+        )
+
+    for start_idx, end_idx in POSE_CONNECTIONS:
+        start_name = LANDMARK_NAMES[start_idx]
+        end_name = LANDMARK_NAMES[end_idx]
+        if start_name not in canvas_points or end_name not in canvas_points:
+            continue
+        cv2.line(canvas, canvas_points[start_name], canvas_points[end_name], color, thickness)
+
+    for point in canvas_points.values():
+        cv2.circle(canvas, point, 5, color, -1)
+
+
+def draw_normalized_angle_highlights(
+    canvas: Frame,
+    learner_points: Dict[str, np.ndarray],
+    angle_df: pd.DataFrame,
+    max_highlights: int = 5,
+) -> None:
+    if angle_df.empty or not learner_points:
+        return
+
+    canvas_height, canvas_width = canvas.shape[:2]
+    scale = min(canvas_width, canvas_height) * 0.36
+    highlight_df = angle_df[angle_df["is_large_difference"]].head(max_highlights)
+
+    for _, row in highlight_df.iterrows():
+        vertex_joint = row["vertex_joint"]
+        if vertex_joint not in learner_points:
+            continue
+
+        point = normalized_to_canvas_point(
+            learner_points[vertex_joint],
+            canvas_width,
+            canvas_height,
+            scale,
+        )
+        cv2.circle(canvas, point, 24, HIGHLIGHT_COLOR, 4)
+        cv2.circle(canvas, point, 7, HIGHLIGHT_COLOR, -1)
+
+        label = f"{row['angle_label']} {row['signed_diff_deg']:+.0f}deg"
+        text_x = min(point[0] + 24, canvas_width - 250)
+        text_y = max(point[1] - 12, 35)
+        draw_text_with_background(canvas, label, (text_x, text_y), font_scale=0.55, thickness=2)
+
+
+def create_normalized_overlay_panel(
+    target_row: pd.Series,
+    learner_row: pd.Series,
+    angle_df: pd.DataFrame,
+    panel_width: int,
+    panel_height: int,
+) -> Frame:
+    """Create a clean panel showing only normalized skeletons overlaid."""
+    canvas = np.full((panel_height, panel_width, 3), 245, dtype=np.uint8)
+
+    target_points = get_normalized_joint_coordinates(target_row, LANDMARK_NAMES)
+    learner_points = get_normalized_joint_coordinates(learner_row, LANDMARK_NAMES)
+
+    draw_text_with_background(
+        canvas,
+        "normalized skeleton overlay",
+        (20, 35),
+        font_scale=0.7,
+        thickness=2,
+    )
+    draw_text_with_background(
+        canvas,
+        "target=green learner=red highlight=yellow",
+        (20, 68),
+        font_scale=0.55,
+        thickness=2,
+    )
+
+    # Draw target first and learner second so the learner difference is easy to see.
+    draw_normalized_skeleton(canvas, target_points, TARGET_COLOR, thickness=3)
+    draw_normalized_skeleton(canvas, learner_points, LEARNER_COLOR, thickness=3)
+    draw_normalized_angle_highlights(canvas, learner_points, angle_df)
+
+    # Draw hip-center reference point.
+    center_point = (panel_width // 2, int(panel_height * 0.62))
+    cv2.circle(canvas, center_point, 6, (80, 80, 80), -1)
+    draw_text_with_background(canvas, "hip center", (center_point[0] + 12, center_point[1] + 5), font_scale=0.45, thickness=1)
+
+    return canvas
+
+
 def create_side_by_side_snapshot(
     frame_bgr: Frame,
     target_row: pd.Series,
@@ -357,27 +518,45 @@ def create_side_by_side_snapshot(
     time_sec: float,
     frame_index: int,
 ) -> Frame:
-    target_frame = frame_bgr.copy()
-    learner_frame = frame_bgr.copy()
+    """Create a snapshot with video comparison and normalized skeleton overlay.
 
-    draw_pose(target_row, target_frame, TARGET_COLOR, thickness=2)
-    draw_pose(learner_row, learner_frame, LEARNER_COLOR, thickness=2)
-    draw_angle_highlights(learner_row, learner_frame, angle_df)
+    Left: original frame with both skeletons overlaid.
+    Right: normalized skeleton-only overlay for easier form comparison.
+    Bottom: top angle differences.
+    """
+    comparison_frame = frame_bgr.copy()
+    draw_pose(target_row, comparison_frame, TARGET_COLOR, thickness=2)
+    draw_pose(learner_row, comparison_frame, LEARNER_COLOR, thickness=2)
+    draw_angle_highlights(learner_row, comparison_frame, angle_df)
 
-    draw_text_with_background(target_frame, "target", (20, 35), font_scale=0.8, thickness=2)
-    draw_text_with_background(learner_frame, "learner", (20, 35), font_scale=0.8, thickness=2)
     draw_text_with_background(
-        learner_frame,
+        comparison_frame,
+        "video overlay: target=green learner=red",
+        (20, 35),
+        font_scale=0.65,
+        thickness=2,
+    )
+    draw_text_with_background(
+        comparison_frame,
         f"time={time_sec:.2f}s frame={frame_index}",
-        (20, 70),
+        (20, 68),
         font_scale=0.6,
         thickness=2,
     )
 
-    snapshot = np.hstack([target_frame, learner_frame])
+    frame_height, frame_width = frame_bgr.shape[:2]
+    normalized_overlay = create_normalized_overlay_panel(
+        target_row=target_row,
+        learner_row=learner_row,
+        angle_df=angle_df,
+        panel_width=frame_width,
+        panel_height=frame_height,
+    )
+
+    snapshot = np.hstack([comparison_frame, normalized_overlay])
 
     top_diffs = angle_df.head(5)
-    panel_height = max(140, 35 + len(top_diffs) * 26)
+    panel_height = max(150, 45 + len(top_diffs) * 28)
     panel = np.zeros((panel_height, snapshot.shape[1], 3), dtype=np.uint8)
 
     draw_text_with_background(
@@ -389,16 +568,16 @@ def create_side_by_side_snapshot(
     )
 
     if top_diffs.empty:
-        draw_text_with_background(panel, "No valid angle comparison.", (20, 70), font_scale=0.6, thickness=2)
+        draw_text_with_background(panel, "No valid angle comparison.", (20, 75), font_scale=0.6, thickness=2)
     else:
-        y = 70
+        y = 75
         for _, row in top_diffs.iterrows():
             label = (
                 f"{row['angle_label']}: target={row['target_angle_deg']:.1f}deg, "
                 f"learner={row['learner_angle_deg']:.1f}deg, diff={row['signed_diff_deg']:+.1f}deg"
             )
             draw_text_with_background(panel, label, (20, y), font_scale=0.55, thickness=1)
-            y += 26
+            y += 28
 
     output_image = np.vstack([snapshot, panel])
     return output_image

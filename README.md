@@ -1,6 +1,14 @@
 # dance-motion-comparison
 Dance Motion Comparison
 
+## Demo
+
+![Pose Snapshot](docs/pose_snapshot.png)
+
+目標ダンサーと学習者の骨格を比較し、
+
+角度差が大きい部位をハイライト表示します。
+
 概要
 
 Dance Motion Comparison は、ダンス動画から骨格情報を抽出し、目標とするダンサーと学習者の動きの違いを可視化するダンス学習支援システムです。
