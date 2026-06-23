@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -160,6 +161,84 @@ def show_top_feedback_cards(path: Path, max_items: int = 5) -> None:
             st.write(row["comment"])
 
 
+# --- New helpers for timeline snapshot link ---
+
+def parse_time_range_center_sec(time_range: str) -> float:
+    """Return the center time from strings such as '12.0-14.0s'."""
+    numbers = re.findall(r"\d+(?:\.\d+)?", str(time_range))
+    if len(numbers) >= 2:
+        start_sec = float(numbers[0])
+        end_sec = float(numbers[1])
+        return (start_sec + end_sec) / 2.0
+    if len(numbers) == 1:
+        return float(numbers[0])
+    return 0.0
+
+
+def show_timeline_snapshot_link(outputs: dict[str, Path], angle_threshold: float) -> None:
+    """Generate a Pose Snapshot directly from a selected Difference Timeline item."""
+    feedback_path = outputs["top_feedback_points_csv"]
+    if not feedback_path.exists():
+        st.warning(f"Top feedback file が見つかりません: {feedback_path}")
+        return
+
+    feedback_df = pd.read_csv(feedback_path)
+    if feedback_df.empty:
+        st.info("Pose Snapshotに連携できる改善ポイントがありません。")
+        return
+
+    st.subheader("改善ポイントからPose Snapshotを確認")
+    st.caption("確認したい改善ポイントを選ぶと、その時間帯の中央時刻で姿勢差を表示します。")
+
+    options: list[str] = []
+    for rank, (_, row) in enumerate(feedback_df.iterrows(), start=1):
+        options.append(
+            f"{rank}. {row['time_range']}｜{row['body_part']}｜{row['metric']}｜score {row['importance_score']:.1f}"
+        )
+
+    selected_option = st.selectbox(
+        "確認する改善ポイント",
+        options=options,
+        key="timeline_snapshot_selected_option",
+    )
+    selected_index = options.index(selected_option)
+    selected_row = feedback_df.iloc[selected_index]
+    snapshot_time_sec = parse_time_range_center_sec(selected_row["time_range"])
+
+    st.info(
+        f"選択中: {selected_row['time_range']} の中央時刻 {snapshot_time_sec:.1f} 秒でPose Snapshotを生成します。"
+    )
+
+    if st.button("この改善ポイントのPose Snapshotを生成", type="secondary"):
+        try:
+            snapshot_outputs = run_pose_snapshot(
+                video_path=outputs["input_video"],
+                target_csv_path=outputs["person_0_pose_csv"],
+                learner_csv_path=outputs["person_1_pose_csv"],
+                output_dir=outputs["run_dir"] / "multi" / "snapshot",
+                time_sec=snapshot_time_sec,
+                angle_diff_threshold_deg=angle_threshold,
+                decimals=3,
+            )
+            st.session_state["snapshot_outputs"] = snapshot_outputs
+            st.session_state["linked_snapshot_time_sec"] = snapshot_time_sec
+            st.success("選択した改善ポイントのPose Snapshotを生成しました。")
+        except Exception as error:
+            st.exception(error)
+            return
+
+    linked_snapshot_outputs = st.session_state.get("snapshot_outputs")
+    linked_snapshot_time_sec = st.session_state.get("linked_snapshot_time_sec")
+    if linked_snapshot_outputs and linked_snapshot_time_sec == snapshot_time_sec:
+        snapshot_image = linked_snapshot_outputs.get("pose_snapshot_image")
+        if snapshot_image and snapshot_image.exists():
+            st.image(
+                str(snapshot_image),
+                caption=f"Pose Snapshot at {snapshot_time_sec:.1f}s",
+                use_container_width=True,
+            )
+
+
 # Pose Snapshot controls helper
 def show_pose_snapshot_controls(outputs: dict[str, Path], angle_threshold: float) -> None:
     video_path = outputs["input_video"]
@@ -201,6 +280,9 @@ def show_pose_snapshot_controls(outputs: dict[str, Path], angle_threshold: float
             st.exception(error)
             return
 
+    linked_snapshot_time_sec = st.session_state.get("linked_snapshot_time_sec")
+    if linked_snapshot_time_sec is not None:
+        st.caption(f"改善ポイント連携で生成したSnapshot: {linked_snapshot_time_sec:.1f}秒")
     snapshot_outputs = st.session_state.get("snapshot_outputs")
     if not snapshot_outputs:
         st.info("時刻を指定してPose Snapshotを生成してください。")
@@ -212,10 +294,10 @@ def show_pose_snapshot_controls(outputs: dict[str, Path], angle_threshold: float
     if snapshot_image.exists():
         st.image(str(snapshot_image), caption="Pose Snapshot", use_container_width=True)
 
-    if snapshot_csv.exists():
-        st.subheader("角度差の詳細")
-        snapshot_df = pd.read_csv(snapshot_csv)
-        st.dataframe(snapshot_df, use_container_width=True)
+    #if snapshot_csv.exists():
+        #st.subheader("角度差の詳細")
+        #snapshot_df = pd.read_csv(snapshot_csv)
+        #st.dataframe(snapshot_df, use_container_width=True)
 
 
 # Trajectory Compare controls helper
@@ -305,14 +387,14 @@ def show_trajectory_compare_controls(outputs: dict[str, Path]) -> None:
             use_container_width=True,
         )
 
-    if trajectory_plot and trajectory_plot.exists():
-        st.subheader("正規化座標での軌道比較")
-        st.image(str(trajectory_plot), caption="Trajectory Compare", use_container_width=True)
+    #if trajectory_plot and trajectory_plot.exists():
+        #st.subheader("正規化座標での軌道比較")
+        #st.image(str(trajectory_plot), caption="Trajectory Compare", use_container_width=True)
 
-    if trajectory_csv.exists():
-        st.subheader("軌道比較の詳細")
-        trajectory_df = pd.read_csv(trajectory_csv)
-        st.dataframe(trajectory_df, use_container_width=True)
+    #if trajectory_csv.exists():
+        #st.subheader("軌道比較の詳細")
+        #trajectory_df = pd.read_csv(trajectory_csv)
+        #st.dataframe(trajectory_df, use_container_width=True)
 
 
 def run_full_pipeline(
@@ -323,6 +405,7 @@ def run_full_pipeline(
     trail_sec: float,
     dynamics_threshold: float,
     trajectory_threshold_px: float,
+    min_time_gap_sec: float,
 ) -> dict[str, Path]:
     outputs: dict[str, Path] = {}
 
@@ -392,7 +475,8 @@ def run_full_pipeline(
             angle_summary_csv=angle_outputs["angle_difference_summary_csv"],
             body_part_difference_csv=comparison_outputs["body_part_difference_csv"],
             output_dir=timeline_output_dir,
-            top_n=10,
+            top_n=20,
+            min_time_gap_sec=min_time_gap_sec,
             decimals=3,
             create_plot=True,
         )
@@ -471,6 +555,14 @@ def main() -> None:
             value=80.0,
             step=10.0,
         )
+        min_time_gap_sec = st.slider(
+            "改善ポイント間隔 [sec]",
+            min_value=0.0,
+            max_value=10.0,
+            value=5.0,
+            step=1.0,
+            help="Top feedbackで近い時刻の改善点が重複しすぎないようにする間隔です。",
+        )
 
     if not POSE_MODEL_PATH.exists():
         st.error(f"MediaPipe model file が見つかりません: {POSE_MODEL_PATH}")
@@ -503,6 +595,7 @@ def main() -> None:
                 trail_sec=trail_sec,
                 dynamics_threshold=dynamics_threshold,
                 trajectory_threshold_px=trajectory_threshold_px,
+                min_time_gap_sec=min_time_gap_sec,
             )
             st.session_state["outputs"] = outputs
             st.success("解析が完了しました。")
@@ -517,20 +610,23 @@ def main() -> None:
     st.divider()
     st.header("解析結果")
 
-    tab_summary, tab_snapshot, tab_trajectory, tab_video, tab_report, tab_csv = st.tabs(
-        ["改善ポイント", "Pose Snapshot", "Trajectory Compare", "動画", "レポート", "CSV"]
+    tab_summary, tab_snapshot, tab_trajectory, tab_video, tab_report = st.tabs(
+        ["改善ポイント", "シルエット", "軌道", "動画", "レポート"]
     )
 
     with tab_summary:
         st.subheader("今回優先して直すポイント")
-        show_top_feedback_cards(outputs["top_feedback_points_csv"], max_items=5)
+        show_top_feedback_cards(outputs["top_feedback_points_csv"], max_items=20)
+
+        st.divider()
+        show_timeline_snapshot_link(outputs, angle_threshold=angle_threshold)
 
         if outputs.get("difference_timeline_plot") and outputs["difference_timeline_plot"].exists():
             st.subheader("Difference Timeline")
             st.image(str(outputs["difference_timeline_plot"]), caption="差分が大きい時間帯")
 
-        st.subheader("Difference Timeline Report")
-        st.text(read_text_file(outputs["difference_timeline_report_txt"]))
+        with st.expander("Difference Timeline Report", expanded=False):
+            st.text(read_text_file(outputs["difference_timeline_report_txt"]))
 
     with tab_snapshot:
         show_pose_snapshot_controls(outputs, angle_threshold=angle_threshold)
@@ -563,15 +659,18 @@ def main() -> None:
             if outputs.get("angle_difference_plot") and outputs["angle_difference_plot"].exists():
                 st.image(str(outputs["angle_difference_plot"]), caption="角度差分")
 
-    with tab_csv:
-        show_csv_preview(outputs["comparison_summary_csv"], "comparison_summary.csv")
-        show_csv_preview(outputs["body_part_difference_csv"], "body_part_difference_summary.csv")
-        show_csv_preview(outputs["angle_difference_events_csv"], "angle_difference_events.csv")
-        show_csv_preview(outputs["difference_timeline_csv"], "difference_timeline.csv")
-        show_csv_preview(outputs["top_feedback_points_csv"], "top_feedback_points.csv")
+        with st.expander("開発者向け詳細データ", expanded=False):
+            st.caption("研究・デバッグ用の出力です。通常の利用では確認不要です。")
 
-        st.subheader("出力フォルダ")
-        st.code(str(outputs["run_dir"]))
+            show_csv_preview(outputs["comparison_summary_csv"], "comparison_summary.csv")
+            show_csv_preview(outputs["body_part_difference_csv"], "body_part_difference_summary.csv")
+            show_csv_preview(outputs["angle_difference_events_csv"], "angle_difference_events.csv")
+            show_csv_preview(outputs["difference_timeline_csv"], "difference_timeline.csv")
+            show_csv_preview(outputs["top_feedback_points_csv"], "top_feedback_points.csv")
+
+            st.subheader("出力フォルダ")
+            st.code(str(outputs["run_dir"]))
+
 
 
 if __name__ == "__main__":

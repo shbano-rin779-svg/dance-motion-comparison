@@ -1,4 +1,3 @@
-
 """
 Create a difference timeline for dance motion comparison.
 
@@ -29,7 +28,8 @@ ANGLE_SUMMARY_CSV = Path("outputs/multi/angle_comparison/angle_difference_summar
 BODY_PART_DIFF_CSV = Path("outputs/multi/comparison/body_part_difference_summary.csv")
 OUTPUT_DIR = Path("outputs/multi/timeline")
 
-TOP_N = 10
+TOP_N = 20
+MIN_TIME_GAP_SEC = 5.0
 ANGLE_IMPORTANCE_NORMALIZER = 45.0
 BODY_PART_IMPORTANCE_NORMALIZER = 100.0
 
@@ -82,6 +82,10 @@ def normalize_score(value: float, normalizer: float) -> float:
     if pd.isna(value):
         return 0.0
     return float(min(abs(value) / normalizer, 1.0) * 100.0)
+
+
+def get_center_sec(row: pd.Series) -> float:
+    return (float(row["start_sec"]) + float(row["end_sec"])) / 2.0
 
 
 def create_angle_comment(body_part: str, diff_deg: float) -> str:
@@ -219,26 +223,67 @@ def create_difference_timeline(
     return timeline_df
 
 
-def create_top_feedback_points(timeline_df: pd.DataFrame, top_n: int = TOP_N) -> pd.DataFrame:
-    """Select top feedback points while reducing duplicates from the same time and body part."""
+def create_top_feedback_points(
+    timeline_df: pd.DataFrame,
+    top_n: int = TOP_N,
+    min_time_gap_sec: float = MIN_TIME_GAP_SEC,
+) -> pd.DataFrame:
+    """Select top feedback points using time-based non-maximum suppression.
+
+    Events are first sorted by importance. Once an event is selected, events whose
+    center time is too close to an already selected event are skipped. This prevents
+    the top list from being dominated by the earliest time range when many events
+    have the same saturated score.
+    """
     if timeline_df.empty:
         return timeline_df
 
     selected_rows = []
+    selected_center_times: list[float] = []
     used_keys = set()
 
-    for _, row in timeline_df.iterrows():
+    sorted_df = timeline_df.sort_values(
+        ["importance_score", "start_sec"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    for _, row in sorted_df.iterrows():
         key = (row["time_range"], row["body_part"], row["event_type"])
         if key in used_keys:
             continue
 
+        center_sec = get_center_sec(row)
+        is_too_close = any(
+            abs(center_sec - selected_center_sec) < min_time_gap_sec
+            for selected_center_sec in selected_center_times
+        )
+        if is_too_close:
+            continue
+
         selected_rows.append(row)
+        selected_center_times.append(center_sec)
         used_keys.add(key)
 
         if len(selected_rows) >= top_n:
             break
 
-    return pd.DataFrame(selected_rows)
+    # If the time-gap filter is too strict for a short video, fill the remaining
+    # slots with the next best non-duplicate events.
+    if len(selected_rows) < top_n:
+        selected_keys = {
+            (row["time_range"], row["body_part"], row["event_type"])
+            for row in selected_rows
+        }
+        for _, row in sorted_df.iterrows():
+            key = (row["time_range"], row["body_part"], row["event_type"])
+            if key in selected_keys:
+                continue
+            selected_rows.append(row)
+            selected_keys.add(key)
+            if len(selected_rows) >= top_n:
+                break
+
+    return pd.DataFrame(selected_rows).reset_index(drop=True)
 
 
 def plot_difference_timeline(timeline_df: pd.DataFrame, output_path: Path) -> Path:
@@ -322,6 +367,7 @@ def run_difference_timeline(
     body_part_difference_csv: Path = BODY_PART_DIFF_CSV,
     output_dir: Path = OUTPUT_DIR,
     top_n: int = TOP_N,
+    min_time_gap_sec: float = MIN_TIME_GAP_SEC,
     decimals: int = 3,
     create_plot: bool = True,
 ) -> Dict[str, Path]:
@@ -337,7 +383,11 @@ def run_difference_timeline(
         angle_summary_csv=angle_summary_csv,
         body_part_difference_csv=body_part_difference_csv,
     )
-    top_feedback_df = create_top_feedback_points(timeline_df, top_n=top_n)
+    top_feedback_df = create_top_feedback_points(
+        timeline_df,
+        top_n=top_n,
+        min_time_gap_sec=min_time_gap_sec,
+    )
 
     timeline_df.round(decimals).to_csv(timeline_csv, index=False)
     top_feedback_df.round(decimals).to_csv(top_feedback_csv, index=False)
@@ -366,6 +416,7 @@ def main() -> None:
         body_part_difference_csv=BODY_PART_DIFF_CSV,
         output_dir=OUTPUT_DIR,
         top_n=TOP_N,
+        min_time_gap_sec=MIN_TIME_GAP_SEC,
         decimals=3,
         create_plot=True,
     )
