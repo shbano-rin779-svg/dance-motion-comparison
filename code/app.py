@@ -30,6 +30,7 @@ from difference_timeline import run_difference_timeline
 from feature_extraction_multi import run_multi_feature_extraction
 from pose_angle_comparison import run_angle_comparison
 from pose_snapshot import run_pose_snapshot
+from trajectory_compare import AVAILABLE_JOINTS, JOINT_LABELS, run_trajectory_compare
 from trajectory_dynamics_overlay import create_trajectory_dynamics_overlay_video
 from video_overlay import create_angle_overlay_video
 
@@ -215,6 +216,103 @@ def show_pose_snapshot_controls(outputs: dict[str, Path], angle_threshold: float
         st.subheader("角度差の詳細")
         snapshot_df = pd.read_csv(snapshot_csv)
         st.dataframe(snapshot_df, use_container_width=True)
+
+
+# Trajectory Compare controls helper
+def show_trajectory_compare_controls(outputs: dict[str, Path]) -> None:
+    trajectory_output_dir = outputs["run_dir"] / "multi" / "trajectory_compare"
+
+    st.subheader("Trajectory Compare")
+    st.write("指定した区間と部位について、正規化軌道と動画上の軌道を比較します。")
+
+    col1, col2, col3, col4 = st.columns([1, 1, 1.4, 1.2])
+
+    with col1:
+        start_sec = st.number_input(
+            "開始時刻 [sec]",
+            min_value=0.0,
+            value=0.0,
+            step=0.1,
+            format="%.1f",
+        )
+
+    with col2:
+        end_sec = st.number_input(
+            "終了時刻 [sec]",
+            min_value=0.1,
+            value=max(start_sec + 2.0, 2.0),
+            step=0.1,
+            format="%.1f",
+        )
+
+    joint_options = AVAILABLE_JOINTS
+    joint_display_names = [f"{JOINT_LABELS.get(joint, joint)} ({joint})" for joint in joint_options]
+
+    with col3:
+        selected_joint_display = st.selectbox(
+            "比較する部位",
+            options=joint_display_names,
+            index=joint_options.index("right_wrist") if "right_wrist" in joint_options else 0,
+        )
+        selected_joint_index = joint_display_names.index(selected_joint_display)
+        joint_name = joint_options[selected_joint_index]
+
+    with col4:
+        background_label = st.radio(
+            "動画上表示の背景",
+            options=["開始時点", "終了時点"],
+            index=0,
+            horizontal=True,
+            help="基本は開始時点がおすすめです。動き出しからの軌道差が分かりやすくなります。",
+        )
+        background_time_mode = "start" if background_label == "開始時点" else "end"
+
+    if st.button("軌道比較を生成", type="secondary"):
+        try:
+            trajectory_outputs = run_trajectory_compare(
+                target_csv_path=outputs["person_0_pose_csv"],
+                learner_csv_path=outputs["person_1_pose_csv"],
+                video_path=outputs["annotated_video"],
+                output_dir=trajectory_output_dir,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                joint_name=joint_name,
+                decimals=3,
+                create_plot=True,
+                create_video_overlay=True,
+                background_time_mode=background_time_mode,
+            )
+            st.session_state["trajectory_compare_outputs"] = trajectory_outputs
+            st.success("軌道比較を生成しました。")
+        except Exception as error:
+            st.exception(error)
+            return
+
+    trajectory_outputs = st.session_state.get("trajectory_compare_outputs")
+    if not trajectory_outputs:
+        st.info("区間と部位を指定して、軌道比較を生成してください。")
+        return
+
+    trajectory_plot = trajectory_outputs.get("trajectory_compare_plot")
+    trajectory_video_overlay_plot = trajectory_outputs.get("trajectory_video_overlay_plot")
+    trajectory_csv = trajectory_outputs["trajectory_compare_csv"]
+
+    if trajectory_video_overlay_plot and trajectory_video_overlay_plot.exists():
+        st.subheader("動画上での軌道比較")
+        st.image(
+            str(trajectory_video_overlay_plot),
+            caption="Trajectory Compare on video",
+            use_container_width=True,
+        )
+
+    if trajectory_plot and trajectory_plot.exists():
+        st.subheader("正規化座標での軌道比較")
+        st.image(str(trajectory_plot), caption="Trajectory Compare", use_container_width=True)
+
+    if trajectory_csv.exists():
+        st.subheader("軌道比較の詳細")
+        trajectory_df = pd.read_csv(trajectory_csv)
+        st.dataframe(trajectory_df, use_container_width=True)
 
 
 def run_full_pipeline(
@@ -419,8 +517,8 @@ def main() -> None:
     st.divider()
     st.header("解析結果")
 
-    tab_summary, tab_snapshot, tab_video, tab_report, tab_csv = st.tabs(
-        ["改善ポイント", "Pose Snapshot", "動画", "レポート", "CSV"]
+    tab_summary, tab_snapshot, tab_trajectory, tab_video, tab_report, tab_csv = st.tabs(
+        ["改善ポイント", "Pose Snapshot", "Trajectory Compare", "動画", "レポート", "CSV"]
     )
 
     with tab_summary:
@@ -436,6 +534,9 @@ def main() -> None:
 
     with tab_snapshot:
         show_pose_snapshot_controls(outputs, angle_threshold=angle_threshold)
+
+    with tab_trajectory:
+        show_trajectory_compare_controls(outputs)
 
     with tab_video:
         col1, col2 = st.columns(2)
